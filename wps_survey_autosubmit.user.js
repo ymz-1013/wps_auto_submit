@@ -1,17 +1,25 @@
 // ==UserScript==
 // @name         WPS问卷自动提交
 // @namespace    http://tampermonkey.net/
-// @version      3.9
-// @description  定时自动填写SKU并提交WPS问卷（v3.9：提交失败自动恢复并重试）
+// @version      4.5
+// @description  定时自动填写SKU并提交WPS问卷（v4.5：单次预加载和可靠快速重试）
 // @author       You
 // @match        https://f.wps.cn/ksform/*
 // @match        https://f.kdocs.cn/ksform/*
 // @grant        none
 // @run-at       document-start
+// @noframes
 // ==/UserScript==
 
 (function() {
     'use strict';
+
+    if (window.top !== window.self) return;
+    if (window.__wpsSurveyAutoSubmitLoaded) {
+        console.log('[自动提交] 已存在运行实例，跳过重复加载');
+        return;
+    }
+    window.__wpsSurveyAutoSubmitLoaded = true;
 
     var origAdd = EventTarget.prototype.addEventListener;
     EventTarget.prototype.addEventListener = function(type, fn, opt) {
@@ -27,44 +35,28 @@
         e.stopImmediatePropagation();
     }, true);
 
-    console.log('[自动提交] 脚本已加载 v3.9');
+    console.log('[自动提交] 脚本已加载 v4.5');
 
     // ============ 配置区 ============
     var CONFIG = {
         enabled: true,
         submitTime: "2026-05-25 23:00:00",
         sku: "10080808557579",
-        refreshBefore: 10,
         expireAfter: 60,
         pageRenderWait: 0,
         checkInterval: 16,
-        waitButtonTimeout: 5000,
-        maxRefreshCount: 30,
         timeSyncSamples: 5,
         precisionWindow: 1500,
-        // ==== v3.8 自适应耗时校准 ====
-        // calibrateStartBefore: 校准开始时刻 = T - 这个值(秒)
-        //   值越大 -> 校准样本越早, 离真实开抢时刻越远, 可能低估高负载下的 reload 耗时
-        //   值越小 -> 校准样本越贴近真实场景, 但要给 5 轮校准 + 决战刷新预留时间 (≥ 12s)
-        //   20s: 5 轮校准约 10s, 完成时距 T 还有 ~10s, 既贴近真实又留足余量
-        calibrateStartBefore: 20,
-        calibrateRounds: 5,
-        calibrateMaxWaitMs: 8000,
-        // safetyMarginMs:
-        //   = 预计按钮渲染完成相对 T 的偏移
-        //   决战刷新点 = T - renderP75 + safetyMarginMs
-        //
-        //   当前 WPS 场景开抢后再刷新容易进入排队, 所以这里按页面渲染耗时提前刷新,
-        //   目标是让按钮在 T 附近完成渲染并尽快点击。
-        //   0      -> 预计按钮正好在 T 渲染完成
-        //   100~300 -> 预计按钮在 T 后 100~300ms 渲染完成, 降低过早 disabled 风险
-        safetyMarginMs: 200,
+        // ==== v4.5 precheck 卡点预加载 ====
+        // T-3.5s 只刷新一次；开放校验 precheck 最早在 T+80ms 才真正发出。
+        preloadLeadMs: 3500,
+        precheckReleaseDelayMs: 80,
         finalRenderTimeoutMs: 8000,
-        maxFallbackReloads: 5,
         submitResultSettleMs: 800,
         submitResultTimeoutMs: 4000,
-        retryIntervalMs: 250,
-        retryButtonTimeoutMs: 2000
+        failureDetectDelayMs: 650,
+        retryCooldownMs: 250,
+        retryIntervalMs: 80
     };
 
     var STORAGE_KEY = 'wps_auto_submit_state';
@@ -73,6 +65,8 @@
     var TIMELINE_KEY = 'wps_auto_submit_timeline';
 
     var serverTimeDelta = 0;
+    var mainStarted = false;
+    var finalScheduleRegistered = false;
 
     function saveState(s) { localStorage.setItem(STORAGE_KEY, JSON.stringify(s)); }
     function loadState() { try { var s = localStorage.getItem(STORAGE_KEY); return s ? JSON.parse(s) : null; } catch(e) { return null; } }
@@ -82,6 +76,85 @@
     function loadDelta() { try { var v = localStorage.getItem(SERVER_TIME_DELTA_KEY); return v ? parseInt(v, 10) : 0; } catch(e) { return 0; } }
 
     function serverNow() { return Date.now() + serverTimeDelta; }
+
+    function isPrecheckUrl(url) {
+        return /\/ksform\/api\/v3\/campaign\/[^/?]+\/precheck(?:[?#]|$)/.test(String(url || ''));
+    }
+
+    function getPrecheckReleaseTs(url) {
+        if (!isPrecheckUrl(url)) return 0;
+        var state = loadState();
+        if (!state || !state.active || !state.finalReloadIssued || !state.precheckReleaseTs) return 0;
+        return state.precheckReleaseTs;
+    }
+
+    function waitForServerTime(targetTs, callback) {
+        function check() {
+            var left = targetTs - (Date.now() + loadDelta());
+            if (left <= 0) {
+                callback();
+                return;
+            }
+            setTimeout(check, left > 100 ? Math.min(left - 50, 500) : 2);
+        }
+        check();
+    }
+
+    function installPrecheckGate() {
+        var nativeOpen = XMLHttpRequest.prototype.open;
+        var nativeSend = XMLHttpRequest.prototype.send;
+
+        XMLHttpRequest.prototype.open = function(_method, url) {
+            this.__wpsRequestUrl = String(url || '');
+            return nativeOpen.apply(this, arguments);
+        };
+
+        XMLHttpRequest.prototype.send = function() {
+            var xhr = this;
+            var args = Array.prototype.slice.call(arguments);
+            var releaseTs = getPrecheckReleaseTs(xhr.__wpsRequestUrl);
+            if (!releaseTs || Date.now() + loadDelta() >= releaseTs) {
+                return nativeSend.apply(xhr, args);
+            }
+
+            var heldAt = Date.now() + loadDelta();
+            console.log('[自动提交] precheck 已就绪, 暂存至 T+' + CONFIG.precheckReleaseDelayMs + 'ms');
+            tlMark('precheck-held', { waitMs: releaseTs - heldAt });
+            waitForServerTime(releaseTs, function() {
+                console.log('[自动提交] 到达开放校验时刻, 释放 precheck');
+                tlMark('precheck-released', { delayMs: (Date.now() + loadDelta()) - releaseTs });
+                try {
+                    nativeSend.apply(xhr, args);
+                } catch (err) {
+                    console.log('[自动提交] precheck 释放失败: ' + err.message);
+                }
+            });
+        };
+
+        if (window.fetch) {
+            var nativeFetch = window.fetch;
+            window.fetch = function(input) {
+                var context = this;
+                var args = Array.prototype.slice.call(arguments);
+                var url = typeof input === 'string' ? input : (input && input.url);
+                var releaseTs = getPrecheckReleaseTs(url);
+                if (!releaseTs || Date.now() + loadDelta() >= releaseTs) {
+                    return nativeFetch.apply(context, args);
+                }
+                console.log('[自动提交] fetch precheck 已就绪, 暂存至开放时刻');
+                tlMark('precheck-held', { waitMs: releaseTs - (Date.now() + loadDelta()) });
+                return new Promise(function(resolve, reject) {
+                    waitForServerTime(releaseTs, function() {
+                        tlMark('precheck-released', { delayMs: (Date.now() + loadDelta()) - releaseTs });
+                        nativeFetch.apply(context, args).then(resolve, reject);
+                    });
+                });
+            };
+        }
+    }
+
+    serverTimeDelta = loadDelta();
+    installPrecheckGate();
 
     // ============ 决战阶段时间线日志 ============
     function tlPad(n, w) { n = String(n); while (n.length < (w || 2)) n = '0' + n; return n; }
@@ -112,6 +185,9 @@
     var TL_LABELS = {
         'schedule-final':        '📋 计划决战刷新',
         'reload-triggered':      '🔄 触发刷新',
+        'reload-skipped':        '⛔ 跳过重复刷新',
+        'precheck-held':         '⏸ 暂存开放校验',
+        'precheck-released':     '▶️ 释放开放校验',
         'page-loaded':           '📄 新页面加载完成',
         'button-rendered':       '🔘 提交按钮已渲染',
         'button-clickable':      '✅ 提交按钮可点击',
@@ -124,9 +200,7 @@
         'submit-failed':         '⚠️ 提交失败',
         'submit-retry':          '🔁 重新提交',
         'submit-done':           '🎉 提交流程完成',
-        'fallback-reload':       '🆘 兜底刷新',
         'ghost-reload-detected': '👻 检测到第三方刷新',
-        'reschedule-final':      '🔁 重新调度刷新',
         'resume-after-submit':   '⏪ 提交后页面恢复'
     };
     // 事件 extra 的简短摘要(显示在右侧)
@@ -135,21 +209,23 @@
         try {
             switch (type) {
                 case 'schedule-final':
-                    return '渲染P75 ' + extra.avg + 'ms, 上行 ' + (extra.uploadMs != null ? extra.uploadMs : '?') + 'ms, 安全余量 ' + extra.safety + 'ms, 等待 ' + extra.waitMs + 'ms';
+                    return '预加载提前 ' + extra.preloadLeadMs + 'ms, 等待 ' + extra.waitMs + 'ms';
+                case 'precheck-held':
+                    return '剩余 ' + extra.waitMs + 'ms';
+                case 'precheck-released':
+                    return '触发偏差 ' + extra.delayMs + 'ms';
                 case 'reload-triggered':
                     return '阶段=' + extra.phase + (extra.fallback ? ', 兜底#' + extra.fallback : '');
+                case 'reload-skipped':
+                    return '原因=' + extra.reason;
                 case 'page-loaded':
                     return 'reload耗时=' + (extra.reloadElapsedMs >= 0 ? extra.reloadElapsedMs + 'ms' : '未知(可能被第三方跳转)') + (extra.fallback ? ', 兜底#' + extra.fallback : '');
                 case 'button-rendered':
                     return '可点击=' + (extra.clickable ? '是' : '否') + ', reload至此=' + extra.sinceReloadMs + 'ms';
                 case 'button-clickable':
                     return 'reload至此=' + extra.sinceReloadMs + 'ms, 距T=' + extra.msToSubmit + 'ms';
-                case 'fallback-reload':
-                    return '原因: ' + extra.reason + ', 第' + extra.count + '次';
                 case 'ghost-reload-detected':
-                    return '距开抢 ' + extra.msToSubmit + 'ms, avg=' + extra.avg + 'ms, 阈值=' + extra.rescheduleMinMs + 'ms';
-                case 'reschedule-final':
-                    return '模式=' + (extra.mode === 'planned' ? '计划等待' : '立即刷新') + ', 距开抢 ' + extra.msToSubmit + 'ms';
+                    return '距开抢 ' + extra.msToSubmit + 'ms, 决战刷新已执行=' + (extra.finalReloadIssued ? '是' : '否');
                 case 'click-submit-failed':
                     return '原因: ' + extra.reason;
                 case 'submit-failed':
@@ -273,14 +349,25 @@
         var results = [];
         var url = location.origin + '/favicon.ico?_t=' + Math.random();
         var done = 0;
+        var finished = false;
 
         function once() {
+            if (finished) return;
             var t0 = Date.now();
             var xhr = new XMLHttpRequest();
+            var settled = false;
+            function completeSample() {
+                if (settled || finished) return;
+                settled = true;
+                done++;
+                if (done >= n) finish();
+                else setTimeout(once, 50);
+            }
             try {
                 xhr.open('HEAD', url, true);
                 xhr.timeout = 3000;
                 xhr.onreadystatechange = function() {
+                    if (settled || finished) return;
                     if (xhr.readyState !== 4) return;
                     var t1 = Date.now();
                     var dateHeader = xhr.getResponseHeader('Date');
@@ -292,20 +379,19 @@
                         results.push({ delta: delta, rtt: rtt });
                         console.log('[自动提交] 时间同步样本: rtt=' + rtt + 'ms delta=' + delta + 'ms');
                     }
-                    done++;
-                    if (done >= n) finish();
-                    else setTimeout(once, 50);
+                    completeSample();
                 };
-                xhr.onerror = function() { done++; if (done >= n) finish(); else setTimeout(once, 50); };
-                xhr.ontimeout = function() { done++; if (done >= n) finish(); else setTimeout(once, 50); };
+                xhr.onerror = completeSample;
+                xhr.ontimeout = completeSample;
                 xhr.send();
             } catch(e) {
-                done++;
-                if (done >= n) finish();
+                completeSample();
             }
         }
 
         function finish() {
+            if (finished) return;
+            finished = true;
             if (results.length === 0) {
                 console.log('[自动提交] 时间同步失败, 使用上次缓存');
                 serverTimeDelta = loadDelta();
@@ -334,11 +420,19 @@
         var lastDateSec = null;
         var lastT0 = 0;
         var probeCount = 0;
+        var finished = false;
+
+        function finish() {
+            if (finished) return;
+            finished = true;
+            if (cb) cb();
+        }
 
         function probe() {
+            if (finished) return;
             if (Date.now() >= deadline) {
                 console.log('[自动提交] 边沿检测超时, 共发' + probeCount + '次请求未捕获跳变');
-                if (cb) cb();
+                finish();
                 return;
             }
             var t0 = Date.now();
@@ -347,6 +441,7 @@
                 xhr.open('HEAD', url + '&_=' + t0, true);
                 xhr.timeout = 1000;
                 xhr.onreadystatechange = function() {
+                    if (finished) return;
                     if (xhr.readyState !== 4) return;
                     var t1 = Date.now();
                     probeCount++;
@@ -362,18 +457,18 @@
                         console.log('[自动提交] 🎯 捕获Date跳变! 旧delta=' + serverTimeDelta + 'ms 新delta=' + newDelta + 'ms (调整' + (diff >= 0 ? '+' : '') + diff + 'ms, 探测' + probeCount + '次)');
                         serverTimeDelta = newDelta;
                         saveDelta(serverTimeDelta);
-                        if (cb) cb();
+                        finish();
                         return;
                     }
                     lastDateSec = serverSec;
                     lastT0 = t0;
                     setTimeout(probe, 0);
                 };
-                xhr.onerror = function() { setTimeout(probe, 50); };
-                xhr.ontimeout = function() { setTimeout(probe, 50); };
+                xhr.onerror = function() { if (!finished) setTimeout(probe, 50); };
+                xhr.ontimeout = function() { if (!finished) setTimeout(probe, 50); };
                 xhr.send();
             } catch(e) {
-                setTimeout(probe, 50);
+                if (!finished) setTimeout(probe, 50);
             }
         }
         console.log('[自动提交] 启动边沿检测 (最多' + (maxMs || 1500) + 'ms)...');
@@ -479,7 +574,9 @@
 
     function isButtonClickable(btn) {
         if (!btn) return false;
+        if (!isVisibleNode(btn)) return false;
         if (btn.disabled) return false;
+        if (btn.getAttribute('aria-disabled') === 'true') return false;
         var s = window.getComputedStyle(btn);
         var cls = (typeof btn.className === 'string') ? btn.className.toLowerCase() : '';
         if (cls.indexOf('disabled') >= 0) return false;
@@ -494,9 +591,24 @@
         '.ant-notification-notice, [class*="toast"], [class*="Toast"], ' +
         '[class*="dialog"], [class*="Dialog"], [class*="modal"], [class*="Modal"], ' +
         '[class*="popup"], [class*="Popup"]';
+    var SUCCESS_TEXTS = [
+        '\u63d0\u4ea4\u6210\u529f',
+        '\u95ee\u5377\u5df2\u63d0\u4ea4',
+        '\u60a8\u5df2\u63d0\u4ea4',
+        '\u63d0\u4ea4\u5b8c\u6210',
+        '\u611f\u8c22\u60a8\u7684\u53c2\u4e0e'
+    ];
 
     function compactText(node) {
         return ((node && node.textContent) || '').replace(/\s+/g, '');
+    }
+
+    function containsSuccessText(node) {
+        var text = compactText(node);
+        for (var i = 0; i < SUCCESS_TEXTS.length; i++) {
+            if (text.indexOf(SUCCESS_TEXTS[i]) >= 0) return true;
+        }
+        return false;
     }
 
     function isVisibleNode(node) {
@@ -540,7 +652,8 @@
     }
 
     function hasVisibleSubmitForm() {
-        if (findSubmitButton()) return true;
+        var submitButton = findSubmitButton();
+        if (submitButton && isVisibleNode(submitButton)) return true;
         var inputs = document.querySelectorAll('input, textarea');
         for (var i = 0; i < inputs.length; i++) {
             if (isVisibleNode(inputs[i]) && !inputs[i].disabled) return true;
@@ -549,13 +662,6 @@
     }
 
     function hasSuccessResult() {
-        var successTexts = [
-            '\u63d0\u4ea4\u6210\u529f',
-            '\u95ee\u5377\u5df2\u63d0\u4ea4',
-            '\u60a8\u5df2\u63d0\u4ea4',
-            '\u63d0\u4ea4\u5b8c\u6210',
-            '\u611f\u8c22\u60a8\u7684\u53c2\u4e0e'
-        ];
         var nodes = document.querySelectorAll(
             'h1, h2, h3, [class*="success"], [class*="Success"], ' +
             '[class*="result"], [class*="Result"], [class*="finish"], ' +
@@ -563,30 +669,24 @@
         );
         for (var i = 0; i < nodes.length; i++) {
             if (!isVisibleNode(nodes[i])) continue;
-            var text = compactText(nodes[i]);
-            for (var j = 0; j < successTexts.length; j++) {
-                if (text.indexOf(successTexts[j]) >= 0) return true;
-            }
+            if (containsSuccessText(nodes[i])) return true;
         }
 
-        if (!hasVisibleSubmitForm()) {
-            var bodyText = compactText(document.body);
-            for (var k = 0; k < successTexts.length; k++) {
-                if (bodyText.indexOf(successTexts[k]) >= 0) return true;
-            }
-        }
+        if (!hasVisibleSubmitForm()) return containsSuccessText(document.body);
         return false;
     }
 
-    function findVisibleFailureSurface(confirmInfo) {
+    function findVisibleFailureSurface(confirmInfo, ignoreChangedBaseline) {
         var surfaces = document.querySelectorAll(RESULT_SURFACE_SELECTOR);
         for (var i = 0; i < surfaces.length; i++) {
             var surface = surfaces[i];
             if (!isVisibleNode(surface)) continue;
+            if (containsSuccessText(surface)) continue;
             var unchangedBaseline = false;
             var baseline = (confirmInfo && confirmInfo.baselineSurfaces) || [];
             for (var j = 0; j < baseline.length; j++) {
-                if (baseline[j].node === surface && baseline[j].text === compactText(surface)) {
+                if (baseline[j].node === surface &&
+                    (ignoreChangedBaseline || baseline[j].text === compactText(surface))) {
                     unchangedBaseline = true;
                     break;
                 }
@@ -637,6 +737,7 @@
         dismissFailureSurface(surface);
 
         var startedAt = Date.now();
+        var waitingLogged = false;
         function waitForRetry() {
             if (retryGeneration !== submitFlowGeneration) return;
             if (isExpired()) {
@@ -645,28 +746,20 @@
                 clearReloadTimer();
                 return;
             }
-            if (Date.now() - startedAt >= CONFIG.retryButtonTimeoutMs) {
-                console.log('[自动提交] \u5931\u8d25\u540e\u8868\u5355\u672a\u6062\u590d, \u5237\u65b0\u540e\u7ee7\u7eed');
-                var nextState = loadState() || {};
-                nextState.submitted = false;
-                nextState.submitStatus = 'retry-wait';
-                nextState.phase = 'final-reloading';
-                nextState.active = true;
-                saveState(nextState);
-                doRefresh();
-                return;
-            }
             if (surface && isVisibleNode(surface)) {
                 dismissFailureSurface(surface);
-                setTimeout(waitForRetry, CONFIG.retryIntervalMs);
-                return;
             }
 
+            var elapsed = Date.now() - startedAt;
             var button = findSubmitButton();
-            if (button && isButtonClickable(button)) {
+            if (elapsed >= CONFIG.retryCooldownMs && button && isButtonClickable(button)) {
                 tlMark('submit-retry', { attempt: state.submitAttempt + 1 });
                 doSubmitNow(button);
                 return;
+            }
+            if (!waitingLogged && elapsed >= 2000) {
+                waitingLogged = true;
+                console.log('[自动提交] 失败后表单尚未恢复，继续原地等待，不刷新页面');
             }
             setTimeout(waitForRetry, CONFIG.retryIntervalMs);
         }
@@ -692,16 +785,20 @@
                 finishSubmission('result-watch', generation);
                 return;
             }
-
             var elapsed = Date.now() - startedAt;
-            if (elapsed < CONFIG.submitResultSettleMs) return;
 
-            var failureSurface = findVisibleFailureSurface(confirmInfo);
-            if (failureSurface) {
-                clearInterval(timer);
-                retrySubmission('result-surface-shown', failureSurface, generation);
-                return;
+            if (elapsed >= CONFIG.failureDetectDelayMs) {
+                var failureSurface = findVisibleFailureSurface(
+                    confirmInfo,
+                    elapsed < CONFIG.submitResultSettleMs
+                );
+                if (failureSurface) {
+                    clearInterval(timer);
+                    retrySubmission('result-surface-shown', failureSurface, generation);
+                    return;
+                }
             }
+            if (elapsed < CONFIG.submitResultSettleMs) return;
 
             var confirmStillVisible = confirmInfo && confirmInfo.surface && isVisibleNode(confirmInfo.surface);
             var button = findSubmitButton();
@@ -734,7 +831,6 @@
                 finishSubmission('confirm-watch', generation);
                 return;
             }
-
             var confirmInfo = findVisibleConfirm();
             if (confirmInfo) {
                 clearInterval(timer);
@@ -760,7 +856,7 @@
         console.log('[自动提交] 刷新...');
         var st = loadState() || {};
         if (st.phase === 'final-reloading' || st.phase === 'final') {
-            tlMark('reload-triggered', { phase: st.phase, fallback: st.fallbackCount || 0 });
+            tlMark('reload-triggered', { phase: st.phase });
         }
         var inp = document.querySelectorAll('input, textarea');
         for (var i = 0; i < inp.length; i++) { try { inp[i].value = ''; } catch(e) {} }
@@ -775,29 +871,6 @@
             var ts = parseInt(raw, 10);
             if (!ts) return -1;
             return serverNow() - ts;
-        } catch(e) { return -1; }
-    }
-
-    // 估算本次导航的"HTTP 上行 + 服务器处理 + 首字节"耗时 (ms),
-    // 近似为决战刷新触发到"请求到达服务器"的时间
-    // 用 PerformanceNavigationTiming.responseStart - fetchStart, 不可用时返回 -1
-    function getNavigationUploadMs() {
-        try {
-            if (typeof performance === 'undefined' || !performance.getEntriesByType) return -1;
-            var entries = performance.getEntriesByType('navigation');
-            if (!entries || !entries.length) {
-                // 老接口 fallback
-                if (performance.timing) {
-                    var t = performance.timing;
-                    if (t.responseStart > 0 && t.fetchStart > 0) return t.responseStart - t.fetchStart;
-                }
-                return -1;
-            }
-            var nav = entries[0];
-            if (nav.responseStart > 0 && nav.fetchStart >= 0) {
-                return Math.max(0, Math.round(nav.responseStart - nav.fetchStart));
-            }
-            return -1;
         } catch(e) { return -1; }
     }
 
@@ -839,6 +912,11 @@
 
     function main() {
         if (!CONFIG.enabled) return;
+        if (mainStarted) {
+            console.log('[自动提交] main 已启动，忽略重复调用');
+            return;
+        }
+        mainStarted = true;
 
         if (isExpired()) {
             console.log('[自动提交] 已过期(' + CONFIG.submitTime + '+' + CONFIG.expireAfter + 's), 不执行');
@@ -846,46 +924,25 @@
             return;
         }
 
-        console.log('=== WPS问卷自动提交 v3.9 ===');
+        console.log('=== WPS问卷自动提交 v4.5 ===');
         console.log('目标: ' + CONFIG.submitTime + ' SKU: ' + CONFIG.sku + ' 过期: +' + CONFIG.expireAfter + 's');
 
         serverTimeDelta = loadDelta();
         console.log('[自动提交] 加载缓存 delta=' + serverTimeDelta + 'ms (将立即重新校准)');
+
+        var bootState = loadState();
+        if (bootState && bootState.active && bootState.phase === 'final-reloading' &&
+            bootState.finalReloadIssued) {
+            console.log('[自动提交] 决战预加载页已启动，复用已同步时间并立即监听按钮');
+            runFlow();
+            return;
+        }
 
         syncServerTime(CONFIG.timeSyncSamples, function() {
             refineWithEdgeDetection(1500, function() {
                 runFlow();
             });
         });
-    }
-
-    function waitForButtonRender(timeoutMs, onResult) {
-        var st = Date.now();
-        var rafSupported = typeof window.requestAnimationFrame === 'function';
-        var elapsedFromReload = getReloadElapsedMs();
-
-        function check() {
-            var el = Date.now() - st;
-            var btn = findSubmitButton();
-
-            if (btn) {
-                var ok = isButtonClickable(btn);
-                var totalSinceReload = (elapsedFromReload >= 0) ? (elapsedFromReload + el) : el;
-                console.log('[自动提交] ✓ 按钮已渲染 (本轮' + el + 'ms, 自reload起约' + totalSinceReload + 'ms) clickable=' + ok);
-                onResult({ ok: true, btn: btn, clickable: ok, elapsedSinceReload: totalSinceReload });
-                return;
-            }
-
-            if (el >= timeoutMs) {
-                console.log('[自动提交] ✗ 按钮渲染超时 ' + el + 'ms');
-                onResult({ ok: false, btn: null, clickable: false, elapsedSinceReload: -1 });
-                return;
-            }
-
-            if (rafSupported) requestAnimationFrame(check);
-            else setTimeout(check, CONFIG.checkInterval);
-        }
-        setTimeout(check, CONFIG.pageRenderWait);
     }
 
     function doSubmitNow(btn) {
@@ -932,195 +989,100 @@
         else setTimeout(tryClick, 16);
     }
 
-    function calibrateRound(roundIdx) {
-        var state = loadState() || {};
-        state.phase = 'calibrating';
-        state.calibrateRound = roundIdx;
-        state.active = true;
-        saveState(state);
-
-        if (isExpired()) { console.log('[自动提交] 校准时已过期'); clearState(); clearReloadTimer(); return; }
-
-        var submitTs = new Date(CONFIG.submitTime).getTime();
-        var msToSubmit = submitTs - serverNow();
-        console.log('[自动提交] [校准 ' + (roundIdx + 1) + '/' + CONFIG.calibrateRounds + '] 距开抢' + Math.floor(msToSubmit / 1000) + 's, 即将刷新');
-
-        if (msToSubmit < 8000) {
-            console.log('[自动提交] 距开抢过近, 中止校准, 直接进入决战');
-            state.phase = 'final';
-            state.samples = state.samples || [];
-            saveState(state);
-            scheduleFinalReload();
-            return;
-        }
-
-        setTimeout(doRefresh, 50);
-    }
-
-    function onCalibrationPageLoaded(state) {
-        var roundIdx = state.calibrateRound || 0;
-        console.log('[自动提交] 校准刷新返回 (round ' + (roundIdx + 1) + ')');
-
-        // 同步采集本次导航的网络耗时, 不依赖按钮渲染是否成功
-        var navMs = getNavigationUploadMs();
-        var uploadOneWayMs = navMs > 0 ? Math.round(navMs / 2) : -1;
-
-        waitForButtonRender(CONFIG.calibrateMaxWaitMs, function(res) {
-            var samples = state.samples || [];
-            if (res.ok && res.elapsedSinceReload > 0) {
-                samples.push(res.elapsedSinceReload);
-                console.log('[自动提交] [校准 ' + (roundIdx + 1) + '] 渲染耗时样本: ' + res.elapsedSinceReload + 'ms, 累计样本=' + JSON.stringify(samples));
-            } else {
-                console.log('[自动提交] [校准 ' + (roundIdx + 1) + '] 未取到渲染耗时');
-            }
-            var uploadSamples = state.uploadSamples || [];
-            if (uploadOneWayMs > 0) {
-                uploadSamples.push(uploadOneWayMs);
-                console.log('[自动提交] [校准 ' + (roundIdx + 1) + '] 上行单程估算: ' + uploadOneWayMs + 'ms (responseStart-fetchStart=' + navMs + 'ms), 累计=' + JSON.stringify(uploadSamples));
-            } else {
-                console.log('[自动提交] [校准 ' + (roundIdx + 1) + '] PerformanceNavigationTiming 不可用, 跳过上行采样');
-            }
-            state.samples = samples;
-            state.uploadSamples = uploadSamples;
-            saveState(state);
-            clearReloadTimer();
-
-            var nextRound = roundIdx + 1;
-            if (nextRound < CONFIG.calibrateRounds) {
-                state.calibrateRound = nextRound;
-                saveState(state);
-                setTimeout(function() { calibrateRound(nextRound); }, 200);
-            } else {
-                state.phase = 'final';
-                saveState(state);
-                console.log('[自动提交] 校准完成, 进入决战调度');
-                scheduleFinalReload();
-            }
-        });
-    }
-
-    function computeAvgRenderMs(samples) {
-        // 函数名虽叫 "Avg", 实际返回的是 "保守预测的 reload 耗时", 用于决战刷新点 T - avg + safety
-        // 设计原则: 开抢后刷新容易进入排队, 因此预测偏向慢的一侧, 让决战刷新尽量提前。
-        // 兜底值: 1800ms 接近真实开抢时刻 reload 的典型耗时, 比原来的 1500ms 更保守
-        if (!samples || samples.length === 0) return 1800;
-        var sorted = samples.slice().sort(function(a, b) { return a - b; });
-        var n = sorted.length;
-        // (B) 只丢最快的 1 个样本 (通常是缓存命中等离群值), 保留所有较慢的样本
-        //     原版同时丢最大最小, 等于主动剔除了最贴近真实开抢负载的样本
-        var trimmed = (n >= 3) ? sorted.slice(1) : sorted;
-        // (A) 取 P75 分位数而不是平均, 让 "实际耗时 > 预测" 的概率从 50% 降到约 25%
-        var p75Idx = Math.ceil(trimmed.length * 0.75) - 1;
-        p75Idx = Math.max(0, Math.min(p75Idx, trimmed.length - 1));
-        return Math.round(trimmed[p75Idx]);
-    }
-
-    // 估算导航的上行单程耗时, 当前仅用于日志辅助判断。
-    function computeUploadMs(uploadSamples) {
-        if (!uploadSamples || uploadSamples.length === 0) return 50;
-        var sorted = uploadSamples.slice().sort(function(a, b) { return a - b; });
-        var n = sorted.length;
-        var trimmed = (n >= 3) ? sorted.slice(1) : sorted;
-        var p75Idx = Math.ceil(trimmed.length * 0.75) - 1;
-        p75Idx = Math.max(0, Math.min(p75Idx, trimmed.length - 1));
-        return Math.round(trimmed[p75Idx]);
-    }
-
     function scheduleFinalReload() {
         var state = loadState() || {};
-        var avg = computeAvgRenderMs(state.samples);
-        var uploadMs = computeUploadMs(state.uploadSamples);
+        if (state.finalReloadIssued) {
+            console.log('[自动提交] 决战刷新已经执行，跳过重复调度');
+            tlMark('reload-skipped', { reason: 'final-reload-already-issued' });
+            return;
+        }
+        if (finalScheduleRegistered) {
+            console.log('[自动提交] 当前页面已注册决战定时器，跳过重复调度');
+            tlMark('reload-skipped', { reason: 'schedule-already-registered' });
+            return;
+        }
+        finalScheduleRegistered = true;
+
+        var preloadLeadMs = CONFIG.preloadLeadMs;
         var submitTs = new Date(CONFIG.submitTime).getTime();
-        // v3.8 公式: reload 触发时刻 = T - renderP75 + safety
-        //   含义: 按最近校准得到的页面渲染耗时提前刷新, 让按钮尽量在 T+safety 附近渲染完成。
-        //   适用于开抢后刷新会进入排队的场景。
-        var targetReloadTs = submitTs - avg + CONFIG.safetyMarginMs;
+        var targetReloadTs = submitTs - preloadLeadMs;
+        var precheckReleaseTs = submitTs + CONFIG.precheckReleaseDelayMs;
         var nowS = serverNow();
         var wait = targetReloadTs - nowS;
 
-        console.log('[自动提交] 渲染耗时P75=' + avg + 'ms, 上行估算=' + uploadMs + 'ms (仅供参考), 安全余量=+' + CONFIG.safetyMarginMs + 'ms');
-        console.log('[自动提交] 决战刷新点 = T-renderP75+safety = ' + new Date(targetReloadTs).toLocaleString() + '.' + (targetReloadTs % 1000) + ' (距现在' + wait + 'ms)');
-        console.log('[自动提交] 预计按钮渲染完成 ≈ T+' + CONFIG.safetyMarginMs + 'ms');
+        console.log('[自动提交] 固定预加载提前量=' + preloadLeadMs + 'ms');
+        console.log('[自动提交] 决战刷新点 = T-' + preloadLeadMs + 'ms; precheck释放点 = T+' + CONFIG.precheckReleaseDelayMs + 'ms');
 
         tlClear();
-        tlMark('schedule-final', { avg: avg, uploadMs: uploadMs, safety: CONFIG.safetyMarginMs, targetReloadTs: targetReloadTs, waitMs: wait });
+        tlMark('schedule-final', {
+            preloadLeadMs: preloadLeadMs,
+            targetReloadTs: targetReloadTs,
+            precheckReleaseTs: precheckReleaseTs,
+            waitMs: wait
+        });
+
+        state.precheckReleaseTs = precheckReleaseTs;
+        state.finalReloadIssued = false;
+        saveState(state);
+
+        function issueFinalReload(reason) {
+            var latest = loadState() || {};
+            if (latest.finalReloadIssued) {
+                console.log('[自动提交] ' + reason + '触发时发现决战刷新已执行，跳过');
+                tlMark('reload-skipped', { reason: reason + '-already-issued' });
+                return;
+            }
+            latest.phase = 'final-reloading';
+            latest.precheckReleaseTs = precheckReleaseTs;
+            latest.finalReloadIssued = true;
+            saveState(latest);
+            doRefresh();
+        }
 
         if (wait < 0) {
             console.log('[自动提交] 已错过最佳刷新点 ' + (-wait) + 'ms, 立即刷新');
-            state.phase = 'final-reloading';
-            saveState(state);
-            doRefresh();
+            issueFinalReload('过时调度');
             return;
         }
 
         precisionWaitUntil(targetReloadTs, function() {
             if (isExpired()) { console.log('[自动提交] 已过期'); clearState(); return; }
             console.log('[自动提交] 决战时刻到! 服务器时间 ' + new Date(serverNow()).toLocaleString() + ' 偏差' + (serverNow() - targetReloadTs) + 'ms');
-            var s = loadState() || {};
-            s.phase = 'final-reloading';
-            saveState(s);
-            doRefresh();
+            issueFinalReload('精准定时器');
         });
     }
 
     function onFinalPageLoaded() {
         var state = loadState() || {};
 
-        // ============ 加固: 防止残留 state 把脚本错误拉进决战阶段 ============
-        // 触发条件: 距 T 还远超 (calibrateStartBefore + 缓冲), 不应该处于决战
-        // 典型场景: 用户中途改了 submitTime, 但没清 localStorage; 或上一次决战后 state 没正常清理
-        // 风险: 残留的 fallbackCount 会消耗本次开抢的兜底刷新次数; 决战路径上的逻辑也会跑错
-        // 处理: 清掉 state, 回退到 runFlow 重新走"等校准 → 校准 → 决战"流程
+        // 防止用户修改 submitTime 后，旧的决战状态被错误沿用。
         var _submitTs = new Date(CONFIG.submitTime).getTime();
         var _msToSubmit = _submitTs - serverNow();
-        var _farThresholdMs = CONFIG.calibrateStartBefore * 1000 + 5000;
+        var _farThresholdMs = CONFIG.preloadLeadMs + 5000;
         if (_msToSubmit > _farThresholdMs) {
             console.log('[自动提交] [决战] ⚠️ 距 T 还有 ' + _msToSubmit + 'ms (> 阈值 ' + _farThresholdMs + 'ms), 不应在决战阶段, 判定为残留 state, 回退到正常流程');
-            tlMark('stale-state-detected', { msToSubmit: _msToSubmit, threshold: _farThresholdMs, oldPhase: state.phase, oldFallbackCount: state.fallbackCount || 0 });
+            tlMark('stale-state-detected', { msToSubmit: _msToSubmit, threshold: _farThresholdMs, oldPhase: state.phase });
             clearState();
             clearReloadTimer();
             runFlow();
             return;
         }
 
-        var fallbackCnt = state.fallbackCount || 0;
         var reloadElapsedMs = getReloadElapsedMs();
-        console.log('[自动提交] 决战页面加载 (兜底刷新次数=' + fallbackCnt + '), 开始等待按钮可点击');
-        tlMark('page-loaded', { fallback: fallbackCnt, reloadElapsedMs: reloadElapsedMs });
+        console.log('[自动提交] 决战页面加载，开始等待按钮可点击');
+        tlMark('page-loaded', { reloadElapsedMs: reloadElapsedMs });
 
-        // ============ 防御: 检测非本脚本触发的页面跳转 ============
-        // 如果 reloadElapsedMs === -1, 说明 LOAD_START_KEY 没被写过, 这次跳转不是 doRefresh 触发的
-        // (WPS 排队页/未开始页常常会自己 reload), 我们的精准定时被吹掉了
-        // 注意: WPS 的提交按钮不会自动从 disabled 变成 enabled, 所以无论距开抢多远,
-        // 留在当前页等都是浪费; 必须重排刷新把控制权抢回来
+        // 决战刷新已经发出后，即使导航标记因页面跳转丢失，也不能再次刷新。
         if (reloadElapsedMs < 0) {
-            var submitTs = new Date(CONFIG.submitTime).getTime();
-            var msToSubmit = submitTs - serverNow();
-            var avg = computeAvgRenderMs(state.samples);
-            var uploadMs = computeUploadMs(state.uploadSamples);
-            // v3.8: 重排需要预留一次完整渲染耗时, 否则开抢后刷新可能直接进入排队。
-            var rescheduleMinMs = avg + 200;
-            tlMark('ghost-reload-detected', { msToSubmit: msToSubmit, avg: avg, uploadMs: uploadMs, rescheduleMinMs: rescheduleMinMs });
-
-            if (msToSubmit > rescheduleMinMs) {
-                console.log('[自动提交] ⚠️ 检测到非本脚本触发的页面跳转 (reloadElapsedMs=-1), 距开抢' + msToSubmit + 'ms > ' + rescheduleMinMs + 'ms, 重新调度决战刷新');
-                tlMark('reschedule-final', { msToSubmit: msToSubmit, mode: 'planned' });
-                clearReloadTimer();
-                var s = loadState() || {};
-                s.phase = 'final';
-                saveState(s);
-                scheduleFinalReload();
-                return;
+            var msToSubmit = new Date(CONFIG.submitTime).getTime() - serverNow();
+            tlMark('ghost-reload-detected', { msToSubmit: msToSubmit, finalReloadIssued: !!state.finalReloadIssued });
+            if (state.finalReloadIssued) {
+                console.log('[自动提交] 决战刷新已执行，忽略导航标记缺失并继续等待，禁止二次刷新');
             } else {
-                // 剩余时间不够再做一次完整决战刷新, 但 WPS 按钮不会自动 enable, 继续等也没意义
-                // 立即触发一次刷新, 哪怕略晚也比死等强
-                console.log('[自动提交] ⚠️ 非本脚本触发的跳转, 距开抢仅' + msToSubmit + 'ms (<' + rescheduleMinMs + 'ms), WPS按钮不会自动启用, 立即刷新抢回控制权');
-                tlMark('reschedule-final', { msToSubmit: msToSubmit, mode: 'immediate' });
-                clearReloadTimer();
-                var s2 = loadState() || {};
-                s2.phase = 'final-reloading';
-                saveState(s2);
-                doRefresh();
+                console.log('[自动提交] 决战刷新尚未执行，重新计算唯一一次预加载刷新');
+                state.phase = 'final';
+                saveState(state);
+                scheduleFinalReload();
                 return;
             }
         }
@@ -1129,28 +1091,8 @@
         var rafSupported = typeof window.requestAnimationFrame === 'function';
         var elapsedFromReload = reloadElapsedMs;
         var lastLog = 0;
-        var triggered = false;
         var btnRenderedMarked = false;
-
-        function fallbackReload(reason) {
-            if (triggered) return;
-            triggered = true;
-            if (fallbackCnt >= CONFIG.maxFallbackReloads) {
-                console.log('[自动提交] [决战] 兜底刷新已达上限(' + CONFIG.maxFallbackReloads + '), 停在当前页面持续等待');
-                fallbackCnt = CONFIG.maxFallbackReloads;
-                triggered = false;
-                requestAnimationFrame(check);
-                return;
-            }
-            console.log('[自动提交] [决战] ' + reason + ', 触发第' + (fallbackCnt + 1) + '次兜底刷新');
-            tlMark('fallback-reload', { reason: reason, count: fallbackCnt + 1 });
-            clearReloadTimer();
-            var s = loadState() || {};
-            s.phase = 'final-reloading';
-            s.fallbackCount = fallbackCnt + 1;
-            saveState(s);
-            setTimeout(doRefresh, 30);
-        }
+        var renderTimeoutMarked = false;
 
         function check() {
             if (isExpired()) { console.log('[自动提交] 已过期'); clearState(); clearReloadTimer(); return; }
@@ -1176,10 +1118,6 @@
                     doSubmitNow(btn);
                     return;
                 }
-                if (msToSubmit < -50 && fallbackCnt < CONFIG.maxFallbackReloads) {
-                    fallbackReload('按钮已渲染但仍 disabled (开抢已过' + (-msToSubmit) + 'ms)');
-                    return;
-                }
             } else {
                 if (el - lastLog > 200) {
                     console.log('[自动提交] [决战] 按钮未渲染 ' + el + 'ms 距开抢' + msToSubmit + 'ms');
@@ -1187,9 +1125,9 @@
                 }
             }
 
-            if (el >= CONFIG.finalRenderTimeoutMs && !btn) {
-                fallbackReload('页面加载超时');
-                return;
+            if (el >= CONFIG.finalRenderTimeoutMs && !btn && !renderTimeoutMarked) {
+                renderTimeoutMarked = true;
+                console.log('[自动提交] [决战] 页面加载超时，继续原地等待，不再刷新以避免进入排队');
             }
 
             if (rafSupported) requestAnimationFrame(check);
@@ -1225,42 +1163,36 @@
                 }
                 return;
             }
-            if (state.phase === 'calibrating') {
-                onCalibrationPageLoaded(state);
-                return;
-            }
-            if (state.phase === 'final' || state.phase === 'final-reloading') {
+            if (state && (state.phase === 'final' || state.phase === 'final-reloading')) {
                 onFinalPageLoaded();
                 return;
             }
-            console.log('[自动提交] 旧状态phase=' + state.phase + ', 清除重来');
-            clearState();
+            if (state) {
+                console.log('[自动提交] 旧状态phase=' + state.phase + ', 清除重来');
+                clearState();
+            }
         }
 
         if (diff <= 0 && !isExpired()) {
             console.log('[自动提交] 时间已过但未过期, 直接进入决战模式');
-            saveState({ phase: 'final-reloading', active: true, samples: [] });
+            saveState({
+                phase: 'final-reloading',
+                active: true,
+                precheckReleaseTs: submitTs + CONFIG.precheckReleaseDelayMs,
+                finalReloadIssued: true
+            });
             doRefresh();
             return;
         }
 
-        var calibrateStartTs = submitTs - CONFIG.calibrateStartBefore * 1000;
-
-        if (diff > CONFIG.calibrateStartBefore * 1000) {
-            var w = calibrateStartTs - serverNow();
-            console.log('[自动提交] 距校准开始 ' + Math.floor(w / 1000) + 's, 进入两段式精准定时');
-            precisionWaitUntil(calibrateStartTs, function() {
-                if (isExpired()) { console.log('[自动提交] 已过期'); clearState(); return; }
-                console.log('[自动提交] 校准开始时间到, 启动第一轮');
-                saveState({ phase: 'calibrating', calibrateRound: 0, samples: [], active: true });
-                calibrateRound(0);
-            });
-            return;
-        }
-
-        console.log('[自动提交] 距开抢仅 ' + Math.floor(diff / 1000) + 's, 启动校准');
-        saveState({ phase: 'calibrating', calibrateRound: 0, samples: [], active: true });
-        calibrateRound(0);
+        console.log('[自动提交] 进入单次预加载调度，开抢前不再进行校准刷新');
+        saveState({
+            phase: 'final',
+            active: true,
+            precheckReleaseTs: submitTs + CONFIG.precheckReleaseDelayMs,
+            finalReloadIssued: false
+        });
+        scheduleFinalReload();
     }
 
     if (document.readyState === 'loading') {
