@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         WPS问卷自动提交
 // @namespace    http://tampermonkey.net/
-// @version      4.25
-// @description  定时自动填写SKU并提交WPS问卷（v4.25：XHR直提与快速超时降级）
+// @version      4.26
+// @description  定时自动填写SKU并提交WPS问卷（v4.26：重复提交11001继续串行直提）
 // @author       You
 // @match        https://f.wps.cn/ksform/*
 // @match        https://f.kdocs.cn/ksform/*
@@ -33,7 +33,7 @@
         configurable: true
     });
 
-    console.log('[自动提交] 脚本已加载 v4.25');
+    console.log('[自动提交] 脚本已加载 v4.26');
 
     // ============ 配置区 ============
     var CONFIG = {
@@ -83,7 +83,7 @@
     var directReleaseSchedulerStarted = false;
     var directAttemptCount = 0;
     var DIRECT_SKU_QUESTION_TYPES = ['input', 'numberText'];
-    var DIRECT_QUEUE_BUSINESS_CODES = [10005, 13711];
+    var DIRECT_QUEUE_BUSINESS_CODES = [10005, 11001, 13711];
     var DIRECT_TERMINAL_BUSINESS_CODES = [13016];
     var directContext = {
         aesKeyBase64: '',
@@ -2450,7 +2450,7 @@
             return;
         }
 
-        console.log('=== WPS问卷自动提交 v4.25 ===');
+        console.log('=== WPS问卷自动提交 v4.26 ===');
         console.log('目标: ' + CONFIG.submitTime + ' SKU: ' + CONFIG.sku + ' 过期: +' + CONFIG.expireAfter + 's');
 
         serverTimeDelta = loadDelta();
