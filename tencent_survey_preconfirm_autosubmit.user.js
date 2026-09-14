@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         腾讯问卷预抢确认框自动提交
 // @namespace    http://tampermonkey.net/
-// @version      1.2.0
+// @version      1.3.0
 // @description  循环刷新抢提交闪现，提前进入确认框，自动关闭暂未开始提示，开抢时确认
 // @author       You
 // @match        https://docs.qq.com/form/*
@@ -56,6 +56,7 @@
     var noticeLastMissingAt = 0;
     var submitAttempted = false;
     var confirmScheduled = false;
+    var confirmationLocked = false;
     var stopped = false;
 
     function pad(value, width) {
@@ -280,17 +281,80 @@
         return null;
     }
 
-    function findConfirmButton() {
-        var candidates = document.querySelectorAll(
-            'button,[role="button"],[class*="btn"],[class*="button"],a'
-        );
-        for (var i = 0; i < candidates.length; i++) {
-            var node = candidates[i];
-            if (!isVisible(node) || !isDialogNode(node)) continue;
-            var text = exactText(node);
-            if (text === '确认' || text === '确定' || text === '确认提交') return node;
+    function isSubmitConfirmationText(text) {
+        if (!text || text.indexOf('暂未开始') >= 0) return false;
+        return text.indexOf('确认提交') >= 0 ||
+               text.indexOf('是否提交') >= 0 ||
+               text.indexOf('确定提交') >= 0 ||
+               (text.indexOf('提交') >= 0 && text.indexOf('结果吗') >= 0);
+    }
+
+    function findConfirmationDialog() {
+        var selectors =
+            '[role="dialog"],[role="alertdialog"],[class*="dialog"],' +
+            '[class*="modal"],[class*="popup"],[class*="overlay"],[class*="mask"]';
+        var dialogs = document.querySelectorAll(selectors);
+        var best = null;
+        var bestLength = Infinity;
+        var i;
+
+        for (i = 0; i < dialogs.length; i++) {
+            var dialogText = exactText(dialogs[i]);
+            if (!isVisible(dialogs[i]) || !isSubmitConfirmationText(dialogText)) continue;
+            if (dialogText.length < bestLength) {
+                best = dialogs[i];
+                bestLength = dialogText.length;
+            }
+        }
+        if (best) return best;
+
+        var prompts = document.querySelectorAll('div,section,article,p,span');
+        for (i = 0; i < prompts.length; i++) {
+            var prompt = prompts[i];
+            var promptText = exactText(prompt);
+            if (!isVisible(prompt) || promptText.length > 80 ||
+                !isSubmitConfirmationText(promptText)) continue;
+
+            var root = prompt;
+            while (root.parentElement && root.parentElement !== document.body) {
+                var parentText = exactText(root.parentElement);
+                if (parentText.length > 300) break;
+                root = root.parentElement;
+                if (parentText.indexOf('取消') >= 0 &&
+                    parentText.indexOf('确认') >= 0) return root;
+            }
+            return prompt.parentElement || prompt;
         }
         return null;
+    }
+
+    function findConfirmButton(scope) {
+        var root = scope || document;
+        var candidates = root.querySelectorAll(
+            'button,[role="button"],[class*="btn"],[class*="button"],a,div,span'
+        );
+        var best = null;
+        var bestScore = -1;
+        for (var i = 0; i < candidates.length; i++) {
+            var node = candidates[i];
+            if (!isVisible(node)) continue;
+            var text = exactText(node);
+            if (text !== '确认' && text !== '确定' && text !== '确认提交') continue;
+            if (!scope && !confirmationLocked && !isDialogNode(node)) continue;
+
+            var score = 0;
+            if (node.tagName === 'BUTTON') score += 4;
+            if (node.getAttribute('role') === 'button') score += 3;
+            var className = String(node.className || '').toLowerCase();
+            if (className.indexOf('primary') >= 0) score += 2;
+            if (className.indexOf('btn') >= 0 ||
+                className.indexOf('button') >= 0) score += 1;
+            if (score > bestScore) {
+                best = node;
+                bestScore = score;
+            }
+        }
+        return best;
     }
 
     function clickNode(node) {
@@ -457,14 +521,38 @@
         tick();
     }
 
+    function lockForConfirmation(dialog, source) {
+        if (confirmationLocked) return;
+        confirmationLocked = true;
+        submitAttempted = true;
+        stopReloadTimer();
+        stopHunter();
+
+        var state = loadState() || {};
+        state.active = true;
+        state.phase = 'preconfirmed';
+        state.confirmSeenAt = serverNow();
+        saveState(state);
+
+        log('[确认框] 已识别并永久停止刷新 source=' + source + ' at=' +
+            formatTime(serverNow()) + ' ' + tOffset(serverNow()) +
+            ' text="' + exactText(dialog).slice(0, 120) + '"');
+    }
+
     function armConfirmationWatcher() {
         if (confirmTimer !== null || confirmScheduled) return;
 
         function inspect(source) {
-            var button = findConfirmButton();
+            var dialog = findConfirmationDialog();
+            if (dialog) lockForConfirmation(dialog, source);
+
+            var button = dialog
+                ? (findConfirmButton(dialog) || findConfirmButton())
+                : (confirmationLocked ? findConfirmButton() : null);
             if (!button) return;
-            stopReloadTimer();
-            stopHunter();
+            if (!confirmationLocked) {
+                lockForConfirmation(dialog || button, source + '-button');
+            }
             confirmScheduled = true;
 
             var state = loadState() || {};
@@ -511,7 +599,10 @@
     }
 
     function reloadWithState(state, reason) {
-        if (submitAttempted || confirmScheduled || findConfirmButton()) {
+        var dialog = findConfirmationDialog();
+        if (dialog) lockForConfirmation(dialog, 'reload-guard');
+        if (confirmationLocked || submitAttempted || confirmScheduled ||
+            findConfirmButton()) {
             log('[刷新] 已进入提交链路，取消刷新 reason=' + reason);
             return;
         }
@@ -522,6 +613,16 @@
     }
 
     function scheduleFallback() {
+        var existingDialog = findConfirmationDialog();
+        if (existingDialog) {
+            lockForConfirmation(existingDialog, 'fallback-start');
+            armConfirmationWatcher();
+            return;
+        }
+        if (confirmationLocked) {
+            armConfirmationWatcher();
+            return;
+        }
         stopReloadTimer();
         stopHunter();
         var state = loadState() || {};
@@ -534,6 +635,9 @@
             submitTimestamp() - CONFIG.fallbackRefreshBeforeMs,
             'T-2s 兜底刷新',
             function() {
+                var dialog = findConfirmationDialog();
+                if (dialog) lockForConfirmation(dialog, 'fallback-guard');
+                if (confirmationLocked) return;
                 var fallback = loadState() || {};
                 fallback.active = true;
                 fallback.phase = 'fallback';
@@ -545,7 +649,9 @@
 
     function verifySubmitResult() {
         setTimeout(function() {
-            if (findConfirmButton()) {
+            var dialog = findConfirmationDialog();
+            if (dialog) lockForConfirmation(dialog, 'submit-result');
+            if (confirmationLocked) {
                 armConfirmationWatcher();
                 return;
             }
@@ -567,7 +673,9 @@
     }
 
     function trySubmit(source) {
-        if (submitAttempted || confirmScheduled || stopped) return false;
+        if (confirmationLocked || submitAttempted || confirmScheduled || stopped) {
+            return false;
+        }
         var button = findSubmitButton();
         if (!button) return false;
         if (!fillSku('before-submit')) {
@@ -598,7 +706,13 @@
         log('[捕手] 启动 mode=' + mode + ' poll=' + interval + 'ms');
 
         function scan(source) {
-            if (confirmScheduled || stopped) return;
+            var dialog = findConfirmationDialog();
+            if (dialog) {
+                lockForConfirmation(dialog, mode + '-' + source);
+                armConfirmationWatcher();
+                return;
+            }
+            if (confirmationLocked || confirmScheduled || stopped) return;
             trySubmit(mode + '-' + source);
         }
 
@@ -638,7 +752,10 @@
 
         var dwell = Math.min(CONFIG.pageDwellMs, Math.max(1, cutoff - serverNow()));
         reloadTimer = setTimeout(function() {
-            if (submitAttempted || confirmScheduled || findConfirmButton()) return;
+            var dialog = findConfirmationDialog();
+            if (dialog) lockForConfirmation(dialog, 'hunt-dwell');
+            if (confirmationLocked || submitAttempted || confirmScheduled ||
+                findConfirmButton()) return;
             if (serverNow() >= cutoff) {
                 scheduleFallback();
                 return;
@@ -765,9 +882,19 @@
         };
 
         if (state.phase === 'submitted') return;
-        if (state.phase === 'submit-pending' || state.phase === 'preconfirmed') {
+        if (state.phase === 'preconfirmed') {
+            confirmationLocked = true;
+            submitAttempted = true;
             armConfirmationWatcher();
-            if (findConfirmButton()) return;
+            return;
+        }
+        if (state.phase === 'submit-pending') {
+            armConfirmationWatcher();
+            var pendingDialog = findConfirmationDialog();
+            if (pendingDialog) {
+                lockForConfirmation(pendingDialog, 'resume-submit-pending');
+                return;
+            }
             state.phase = 'hunting';
             submitAttempted = false;
         }
@@ -836,11 +963,12 @@
         if (state.phase === 'fallback') startHunter('fallback');
         if (state.phase === 'submit-pending' || state.phase === 'preconfirmed') {
             submitAttempted = true;
+            confirmationLocked = state.phase === 'preconfirmed';
             armConfirmationWatcher();
         }
     }
 
-    log('[预抢] standalone v1.2.0 loaded, cachedDelta=' + serverDelta + 'ms');
+    log('[预抢] standalone v1.3.0 loaded, cachedDelta=' + serverDelta + 'ms');
     bootEarly();
 
     var mainStarted = false;
