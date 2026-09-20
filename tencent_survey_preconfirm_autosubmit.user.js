@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         腾讯问卷预抢确认框自动提交
 // @namespace    http://tampermonkey.net/
-// @version      1.3.0
+// @version      1.3.1
 // @description  循环刷新抢提交闪现，提前进入确认框，自动关闭暂未开始提示，开抢时确认
 // @author       You
 // @match        https://docs.qq.com/form/*
@@ -140,6 +140,198 @@
 
     function clearState() {
         localStorage.removeItem(STATE_KEY);
+    }
+
+    // #region debug-point D:network-diagnostic-helper
+    var DEBUG_SERVER_URL = 'http://127.0.0.1:7777/event';
+    var DEBUG_SESSION_ID = 'tencent-submit-loss';
+    var debugNativeFetch = window.fetch;
+
+    function debugRequestUrl(value) {
+        try {
+            var parsed = new URL(String(value), location.href);
+            return parsed.origin + parsed.pathname;
+        } catch (e) {
+            return String(value || '').split('?')[0].slice(0, 300);
+        }
+    }
+
+    function debugResponseText(value) {
+        return String(value == null ? '' : value)
+            .replace(/\s+/g, ' ')
+            .slice(0, 1200);
+    }
+
+    function debugNetworkPhase() {
+        var state = loadState();
+        return state ? state.phase : 'none';
+    }
+
+    function shouldDebugNetwork(method, url) {
+        var normalizedMethod = String(method || 'GET').toUpperCase();
+        if (normalizedMethod === 'GET' || normalizedMethod === 'HEAD') return false;
+        if (String(url || '').indexOf(DEBUG_SERVER_URL) === 0) return false;
+        return Math.abs(serverNow() - submitTimestamp()) <= 120000 ||
+               debugNetworkPhase() === 'submit-pending' ||
+               debugNetworkPhase() === 'preconfirmed' ||
+               debugNetworkPhase() === 'submitted';
+    }
+
+    function reportNetworkDiagnostic(kind, data) {
+        var event = {
+            sessionId: DEBUG_SESSION_ID,
+            runId: 'pre-fix',
+            hypothesisId: data.error ? 'E' : 'D',
+            location: 'tencent_survey_preconfirm_autosubmit.user.js:network',
+            msg: '[DEBUG] Tencent form network ' + kind,
+            data: data,
+            ts: Date.now()
+        };
+
+        try {
+            var logs = JSON.parse(localStorage.getItem(LOG_KEY) || '[]');
+            logs.push({
+                timestamp: event.ts,
+                session: SESSION_ID,
+                message: '[网络诊断] ' + kind + ' ' + JSON.stringify(data)
+            });
+            if (logs.length > 800) logs = logs.slice(logs.length - 800);
+            localStorage.setItem(LOG_KEY, JSON.stringify(logs));
+        } catch (e) {}
+
+        if (typeof debugNativeFetch === 'function') {
+            try {
+                debugNativeFetch.call(window, DEBUG_SERVER_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(event),
+                    keepalive: true
+                }).catch(function() {});
+            } catch (e2) {}
+        }
+    }
+    // #endregion
+
+    // #region debug-point D:fetch-response
+    function installFetchDiagnostics() {
+        if (typeof debugNativeFetch !== 'function' ||
+            window.fetch.__tencentNetworkDiagnostic) return;
+
+        function diagnosticFetch(input, init) {
+            var method = (init && init.method) ||
+                (input && input.method) || 'GET';
+            var rawUrl = typeof input === 'string'
+                ? input
+                : (input && input.url) || '';
+            if (!shouldDebugNetwork(method, rawUrl)) {
+                return debugNativeFetch.apply(this, arguments);
+            }
+
+            var startedAt = Date.now();
+            var requestUrl = debugRequestUrl(rawUrl);
+            var requestArgs = arguments;
+            var requestThis = this;
+            return debugNativeFetch.apply(requestThis, requestArgs).then(
+                function(response) {
+                    var common = {
+                        method: String(method).toUpperCase(),
+                        url: requestUrl,
+                        status: response.status,
+                        ok: response.ok,
+                        durationMs: Date.now() - startedAt,
+                        phase: debugNetworkPhase(),
+                        serverTime: serverNow(),
+                        tOffsetMs: Math.round(serverNow() - submitTimestamp())
+                    };
+                    try {
+                        response.clone().text().then(function(text) {
+                            common.response = debugResponseText(text);
+                            reportNetworkDiagnostic('fetch-response', common);
+                        }).catch(function(error) {
+                            common.bodyReadError = String(error && error.message || error);
+                            reportNetworkDiagnostic('fetch-response', common);
+                        });
+                    } catch (error) {
+                        common.bodyReadError = String(error && error.message || error);
+                        reportNetworkDiagnostic('fetch-response', common);
+                    }
+                    return response;
+                },
+                function(error) {
+                    reportNetworkDiagnostic('fetch-error', {
+                        method: String(method).toUpperCase(),
+                        url: requestUrl,
+                        durationMs: Date.now() - startedAt,
+                        phase: debugNetworkPhase(),
+                        serverTime: serverNow(),
+                        tOffsetMs: Math.round(serverNow() - submitTimestamp()),
+                        error: String(error && error.message || error)
+                    });
+                    throw error;
+                }
+            );
+        }
+
+        diagnosticFetch.__tencentNetworkDiagnostic = true;
+        window.fetch = diagnosticFetch;
+    }
+    // #endregion
+
+    // #region debug-point D:xhr-response
+    function installXhrDiagnostics() {
+        if (!window.XMLHttpRequest ||
+            XMLHttpRequest.prototype.__tencentNetworkDiagnostic) return;
+
+        var nativeOpen = XMLHttpRequest.prototype.open;
+        var nativeSend = XMLHttpRequest.prototype.send;
+
+        XMLHttpRequest.prototype.open = function(method, url) {
+            this.__tencentDebugMethod = method;
+            this.__tencentDebugUrl = url;
+            return nativeOpen.apply(this, arguments);
+        };
+
+        XMLHttpRequest.prototype.send = function(body) {
+            var xhr = this;
+            var method = xhr.__tencentDebugMethod || 'GET';
+            var rawUrl = xhr.__tencentDebugUrl || '';
+            if (shouldDebugNetwork(method, rawUrl)) {
+                var startedAt = Date.now();
+                xhr.addEventListener('loadend', function() {
+                    var response = '';
+                    try {
+                        if (!xhr.responseType || xhr.responseType === 'text') {
+                            response = xhr.responseText;
+                        } else if (xhr.responseType === 'json') {
+                            response = JSON.stringify(xhr.response);
+                        }
+                    } catch (e) {
+                        response = '[unreadable response]';
+                    }
+                    reportNetworkDiagnostic('xhr-response', {
+                        method: String(method).toUpperCase(),
+                        url: debugRequestUrl(xhr.responseURL || rawUrl),
+                        status: xhr.status,
+                        durationMs: Date.now() - startedAt,
+                        phase: debugNetworkPhase(),
+                        serverTime: serverNow(),
+                        tOffsetMs: Math.round(serverNow() - submitTimestamp()),
+                        requestBodyLength: typeof body === 'string' ? body.length : null,
+                        response: debugResponseText(response),
+                        error: xhr.status === 0 ? 'network-error-or-abort' : ''
+                    });
+                }, { once: true });
+            }
+            return nativeSend.apply(xhr, arguments);
+        };
+
+        XMLHttpRequest.prototype.__tencentNetworkDiagnostic = true;
+    }
+    // #endregion
+
+    function installNetworkDiagnostics() {
+        installFetchDiagnostics();
+        installXhrDiagnostics();
     }
 
     function stopReloadTimer() {
@@ -861,6 +1053,45 @@
             ' delta=' + serverDelta + 'ms');
     }
 
+    function recoverConfirmationState(state) {
+        // These flags belong to this document; never reset an in-flight click
+        // or a dialog captured by the early hunter while main() is starting.
+        if (!state || !state.active || confirmationLocked ||
+            submitAttempted || confirmScheduled || stopped) return state;
+        if (state.phase !== 'preconfirmed' && state.phase !== 'submit-pending') {
+            return state;
+        }
+
+        var dialog = findConfirmationDialog();
+        if (dialog) {
+            lockForConfirmation(dialog, 'resume-live-dialog');
+            armConfirmationWatcher();
+            return loadState();
+        }
+
+        // localStorage survives reloads; the old dialog and its timers do not.
+        var previousPhase = state.phase;
+        var now = serverNow();
+        var target = submitTimestamp();
+        if (now < target - CONFIG.huntStartBeforeMs) {
+            state.phase = 'scheduled';
+        } else if (now < target - CONFIG.huntStopBeforeMs &&
+                   (state.refreshCount || 0) < CONFIG.maxRefreshes) {
+            state.phase = 'hunting';
+        } else if (now < target - CONFIG.fallbackRefreshBeforeMs) {
+            state.phase = 'fallback-wait';
+        } else {
+            // Already reloaded at/after T-2s: monitor this page immediately.
+            state.phase = 'fallback';
+        }
+        delete state.confirmSeenAt;
+        delete state.submitClickedAt;
+        saveState(state);
+        log('[恢复] 新页面无确认框，清除历史状态 ' + previousPhase +
+            ' -> ' + state.phase + ' ' + tOffset(now));
+        return state;
+    }
+
     function beginStrategy() {
         if (detectSuccessPage()) return;
         var now = serverNow();
@@ -882,21 +1113,16 @@
         };
 
         if (state.phase === 'submitted') return;
-        if (state.phase === 'preconfirmed') {
-            confirmationLocked = true;
-            submitAttempted = true;
+        state = recoverConfirmationState(state);
+        if (confirmationLocked || submitAttempted || confirmScheduled) {
             armConfirmationWatcher();
             return;
         }
-        if (state.phase === 'submit-pending') {
+        var existingDialog = findConfirmationDialog();
+        if (existingDialog) {
+            lockForConfirmation(existingDialog, 'strategy-live-dialog');
             armConfirmationWatcher();
-            var pendingDialog = findConfirmationDialog();
-            if (pendingDialog) {
-                lockForConfirmation(pendingDialog, 'resume-submit-pending');
-                return;
-            }
-            state.phase = 'hunting';
-            submitAttempted = false;
+            return;
         }
         if (state.phase === 'fallback') {
             startSkuKeeper();
@@ -954,21 +1180,22 @@
     }
 
     function bootEarly() {
+        if (!CONFIG.enabled) return;
         startSuccessObserver();
         startNotStartedDialogGuard();
         startSkuKeeper();
         var state = loadState();
         if (!state || !state.active) return;
+        var target = submitTimestamp();
+        if (!isFinite(target) || serverNow() > target + CONFIG.expireAfterMs) return;
+        state = recoverConfirmationState(state);
+        if (confirmationLocked || stopped) return;
         if (state.phase === 'hunting') startHunter('hunting');
         if (state.phase === 'fallback') startHunter('fallback');
-        if (state.phase === 'submit-pending' || state.phase === 'preconfirmed') {
-            submitAttempted = true;
-            confirmationLocked = state.phase === 'preconfirmed';
-            armConfirmationWatcher();
-        }
     }
 
-    log('[预抢] standalone v1.3.0 loaded, cachedDelta=' + serverDelta + 'ms');
+    installNetworkDiagnostics();
+    log('[预抢] standalone v1.3.1 loaded, cachedDelta=' + serverDelta + 'ms');
     bootEarly();
 
     var mainStarted = false;
