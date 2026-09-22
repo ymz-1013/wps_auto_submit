@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         腾讯问卷预抢确认框自动提交
 // @namespace    http://tampermonkey.net/
-// @version      1.3.1
+// @version      1.3.2
 // @description  循环刷新抢提交闪现，提前进入确认框，自动关闭暂未开始提示，开抢时确认
 // @author       You
 // @match        https://docs.qq.com/form/*
@@ -33,6 +33,7 @@
 
         timeSyncSamples: 5,
         edgeRefineMaxMs: 1500,
+        edgeRefineMaxIntervalMs: 200,
         expireAfterMs: 60000
     };
 
@@ -1016,6 +1017,20 @@
         return values[Math.floor(values.length / 2)];
     }
 
+    function evaluateEdgeRefinement(previous, edge) {
+        var interval = edge.midpoint - previous.midpoint;
+        var headerStep = edge.header - previous.header;
+        var localBoundary = (previous.midpoint + edge.midpoint) / 2;
+        return {
+            accepted: headerStep === 1000 &&
+                      interval > 0 &&
+                      interval <= CONFIG.edgeRefineMaxIntervalMs,
+            delta: Math.round(edge.header - localBoundary),
+            interval: Math.round(interval),
+            headerStep: headerStep
+        };
+    }
+
     async function calibrateServerTime() {
         var deltas = [];
         for (var i = 0; i < CONFIG.timeSyncSamples; i++) {
@@ -1028,24 +1043,43 @@
                 log('[校时] sample=' + (i + 1) + ' 失败: ' + e.message);
             }
         }
-        if (deltas.length) serverDelta = Math.round(median(deltas));
+        var medianDelta = null;
+        if (deltas.length) {
+            medianDelta = Math.round(median(deltas));
+            serverDelta = medianDelta;
+            log('[校时] 普通样本中位数 delta=' + medianDelta + 'ms');
+        }
 
         var refineStartedAt = Date.now();
         var previous = null;
+        var edgeAccepted = false;
         while (Date.now() - refineStartedAt < CONFIG.edgeRefineMaxMs) {
             try {
                 var edge = await fetchServerSample();
                 if (previous && edge.header > previous.header) {
-                    var localBoundary = (previous.midpoint + edge.midpoint) / 2;
-                    serverDelta = Math.round(edge.header - localBoundary);
-                    log('[校时] 秒边沿精校成功 delta=' + serverDelta +
-                        'ms interval=' + Math.round(edge.midpoint - previous.midpoint) + 'ms');
-                    break;
+                    var refinement = evaluateEdgeRefinement(previous, edge);
+                    if (refinement.accepted) {
+                        serverDelta = refinement.delta;
+                        edgeAccepted = true;
+                        log('[校时] 采用秒边沿 delta=' + serverDelta +
+                            'ms interval=' + refinement.interval + 'ms');
+                        break;
+                    }
+                    log('[校时] 拒绝低质量秒边沿 delta=' +
+                        refinement.delta + 'ms interval=' +
+                        refinement.interval + 'ms headerStep=' +
+                        refinement.headerStep + 'ms，阈值=' +
+                        CONFIG.edgeRefineMaxIntervalMs + 'ms');
                 }
                 previous = edge;
             } catch (e2) {
                 break;
             }
+        }
+        if (!edgeAccepted) {
+            log('[校时] 秒边沿未采用，保留' +
+                (medianDelta === null ? '缓存值' : '普通样本中位数') +
+                ' delta=' + serverDelta + 'ms');
         }
 
         localStorage.setItem(DELTA_KEY, String(serverDelta));
@@ -1195,7 +1229,7 @@
     }
 
     installNetworkDiagnostics();
-    log('[预抢] standalone v1.3.1 loaded, cachedDelta=' + serverDelta + 'ms');
+    log('[预抢] standalone v1.3.2 loaded, cachedDelta=' + serverDelta + 'ms');
     bootEarly();
 
     var mainStarted = false;
